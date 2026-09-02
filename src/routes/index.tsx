@@ -2,6 +2,22 @@ import { useState, useEffect, useMemo } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { z } from "zod";
 
+import {
+  Transaction,
+  TransactionType,
+  BudgetLimits,
+  DEFAULT_BUDGETS,
+  EXPENSE_CATEGORIES,
+  ExpenseCategory,
+  CurrencyCode,
+} from "@/lib/finance-types";
+import { convertFromBase, getStoredCurrency } from "@/lib/currency";
+import { CurrencySwitcher } from "@/components/finance/currency-switcher";
+import { BudgetManager } from "@/components/finance/budget-manager";
+import { ExpenseCharts } from "@/components/finance/expense-charts";
+import { ForecastSimulator } from "@/components/finance/forecast-simulator";
+import { ReceiptScanner } from "@/components/finance/receipt-scanner";
+
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
@@ -9,7 +25,7 @@ export const Route = createFileRoute("/")({
       {
         name: "description",
         content:
-          "Track your income and expenses simply. Add transactions, view your balance, and manage your money with a clean, minimal finance tracker.",
+          "Track your income and expenses, forecast your cash flow, scan receipts, and manage budgets with a clean, minimal finance tracker.",
       },
       { property: "og:title", content: "Finance Tracker" },
       {
@@ -23,17 +39,8 @@ export const Route = createFileRoute("/")({
   component: Index,
 });
 
-type TransactionType = "income" | "expense";
-
-interface Transaction {
-  id: string;
-  description: string;
-  amount: number;
-  type: TransactionType;
-  createdAt: number;
-}
-
-const STORAGE_KEY = "finance-tracker-transactions";
+const TRANSACTIONS_STORAGE_KEY = "finance-tracker-transactions";
+const BUDGETS_STORAGE_KEY = "finance-tracker-budgets";
 
 const transactionSchema = z.object({
   description: z
@@ -45,44 +52,95 @@ const transactionSchema = z.object({
   type: z.enum(["income", "expense"]),
 });
 
-function formatCurrency(amount: number): string {
-  return new Intl.NumberFormat("en-IN", {
-    style: "currency",
-    currency: "INR",
-    maximumFractionDigits: 0,
-  }).format(amount);
-}
-
 function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 }
 
+interface StoredTransaction {
+  id: string;
+  description: string;
+  amount: number;
+  type: TransactionType;
+  category?: ExpenseCategory | "Income";
+  createdAt: number;
+}
+
+function migrateTransaction(raw: StoredTransaction): Transaction {
+  // Older stored transactions (pre-category feature) won't have a category.
+  return {
+    id: raw.id,
+    description: raw.description,
+    amount: raw.amount,
+    type: raw.type,
+    category: raw.category ?? (raw.type === "income" ? "Income" : "Other"),
+    createdAt: raw.createdAt,
+  };
+}
+
 function Index() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [budgets, setBudgets] = useState<BudgetLimits>(DEFAULT_BUDGETS);
+  const [currency, setCurrency] = useState<CurrencyCode>("INR");
+  const [rates, setRates] = useState<Record<string, number>>({ INR: 1 });
+
   const [description, setDescription] = useState("");
   const [amount, setAmount] = useState("");
   const [type, setType] = useState<TransactionType>("expense");
+  const [category, setCategory] = useState<ExpenseCategory>("Other");
   const [errors, setErrors] = useState<{ description?: string; amount?: string }>({});
   const [isHydrated, setIsHydrated] = useState(false);
 
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as Transaction[];
-        setTransactions(parsed);
+      const rawTx = localStorage.getItem(TRANSACTIONS_STORAGE_KEY);
+      if (rawTx) {
+        const parsed = JSON.parse(rawTx) as StoredTransaction[];
+        setTransactions(parsed.map(migrateTransaction));
       }
     } catch {
       setTransactions([]);
     }
+
+    try {
+      const rawBudgets = localStorage.getItem(BUDGETS_STORAGE_KEY);
+      if (rawBudgets) {
+        setBudgets(JSON.parse(rawBudgets));
+      }
+    } catch {
+      setBudgets(DEFAULT_BUDGETS);
+    }
+
+    setCurrency(getStoredCurrency());
     setIsHydrated(true);
   }, []);
 
   useEffect(() => {
     if (isHydrated) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(transactions));
+      localStorage.setItem(TRANSACTIONS_STORAGE_KEY, JSON.stringify(transactions));
     }
   }, [transactions, isHydrated]);
+
+  useEffect(() => {
+    if (isHydrated) {
+      localStorage.setItem(BUDGETS_STORAGE_KEY, JSON.stringify(budgets));
+    }
+  }, [budgets, isHydrated]);
+
+  // All amounts are stored in the base currency (INR). This formats any
+  // base-currency amount into the user's currently selected display currency.
+  function formatAmount(amountInBase: number): string {
+    const converted = convertFromBase(amountInBase, currency, rates);
+    return new Intl.NumberFormat(currency === "INR" ? "en-IN" : "en-US", {
+      style: "currency",
+      currency,
+      maximumFractionDigits: currency === "INR" ? 0 : 2,
+    }).format(converted);
+  }
+
+  function handleCurrencyChange(next: CurrencyCode, nextRates: Record<string, number>) {
+    setCurrency(next);
+    setRates(nextRates);
+  }
 
   const totals = useMemo(() => {
     const income = transactions
@@ -97,6 +155,36 @@ function Index() {
       balance: income - expense,
     };
   }, [transactions]);
+
+  const spendingByCategory = useMemo(() => {
+    const totalsByCategory: Record<string, number> = {};
+    const now = new Date();
+    for (const t of transactions) {
+      if (t.type !== "expense") continue;
+      const d = new Date(t.createdAt);
+      // Budgets track the current calendar month.
+      if (d.getFullYear() !== now.getFullYear() || d.getMonth() !== now.getMonth()) continue;
+      totalsByCategory[t.category] = (totalsByCategory[t.category] ?? 0) + t.amount;
+    }
+    return totalsByCategory;
+  }, [transactions]);
+
+  function addTransaction(data: {
+    description: string;
+    amount: number;
+    type: TransactionType;
+    category: ExpenseCategory | "Income";
+  }) {
+    const newTransaction: Transaction = {
+      id: generateId(),
+      description: data.description,
+      amount: data.amount,
+      type: data.type,
+      category: data.category,
+      createdAt: Date.now(),
+    };
+    setTransactions((prev) => [newTransaction, ...prev]);
+  }
 
   function handleAddTransaction(e: React.FormEvent) {
     e.preventDefault();
@@ -122,18 +210,30 @@ function Index() {
 
     setErrors({});
 
-    const newTransaction: Transaction = {
-      id: generateId(),
+    addTransaction({
       description: result.data.description,
       amount: result.data.amount,
       type: result.data.type,
-      createdAt: Date.now(),
-    };
+      category: result.data.type === "income" ? "Income" : category,
+    });
 
-    setTransactions((prev) => [newTransaction, ...prev]);
     setDescription("");
     setAmount("");
     setType("expense");
+    setCategory("Other");
+  }
+
+  function handleReceiptConfirm(data: {
+    description: string;
+    amount: number;
+    category: ExpenseCategory;
+  }) {
+    addTransaction({
+      description: data.description,
+      amount: data.amount,
+      type: "expense",
+      category: data.category,
+    });
   }
 
   function handleDelete(id: string) {
@@ -147,46 +247,47 @@ function Index() {
   return (
     <div className="min-h-screen bg-background px-4 py-8 sm:py-12">
       <div className="mx-auto max-w-3xl space-y-8">
-        <header className="text-center">
+        <header className="flex flex-col items-center gap-3 text-center">
           <h1 className="text-3xl font-bold tracking-tight text-foreground sm:text-4xl">
             Finance Tracker
           </h1>
-          <p className="mt-2 text-muted-foreground">
-            Track your income and expenses simply.
+          <p className="text-muted-foreground">
+            Track your income and expenses, forecast the future, and stay on budget.
           </p>
+          <CurrencySwitcher currency={currency} onChange={handleCurrencyChange} />
         </header>
 
-        <section
-          aria-label="Summary"
-          className="grid grid-cols-1 gap-4 sm:grid-cols-3"
-        >
+        <section aria-label="Summary" className="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <SummaryCard
             label="Total Income"
             amount={totals.income}
             variant="income"
+            formatAmount={formatAmount}
           />
           <SummaryCard
             label="Total Expense"
             amount={totals.expense}
             variant="expense"
+            formatAmount={formatAmount}
           />
           <SummaryCard
             label="Balance"
             amount={totals.balance}
             variant="balance"
+            formatAmount={formatAmount}
           />
         </section>
 
         <section className="rounded-2xl border border-border bg-card p-5 shadow-sm sm:p-6">
-          <h2 className="text-lg font-semibold text-card-foreground">
-            Add Transaction
-          </h2>
+          <h2 className="text-lg font-semibold text-card-foreground">Add Transaction</h2>
+
+          <div className="mt-4">
+            <ReceiptScanner onConfirm={handleReceiptConfirm} />
+          </div>
+
           <form onSubmit={handleAddTransaction} className="mt-4 space-y-4">
             <div>
-              <label
-                htmlFor="description"
-                className="block text-sm font-medium text-foreground"
-              >
+              <label htmlFor="description" className="block text-sm font-medium text-foreground">
                 Description
               </label>
               <input
@@ -199,17 +300,12 @@ function Index() {
                 className="mt-1 w-full rounded-xl border border-input bg-background px-4 py-2.5 text-foreground placeholder:text-muted-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring/20"
               />
               {errors.description && (
-                <p className="mt-1 text-sm text-destructive">
-                  {errors.description}
-                </p>
+                <p className="mt-1 text-sm text-destructive">{errors.description}</p>
               )}
             </div>
 
             <div>
-              <label
-                htmlFor="amount"
-                className="block text-sm font-medium text-foreground"
-              >
+              <label htmlFor="amount" className="block text-sm font-medium text-foreground">
                 Amount
               </label>
               <input
@@ -222,15 +318,11 @@ function Index() {
                 placeholder="Enter amount"
                 className="mt-1 w-full rounded-xl border border-input bg-background px-4 py-2.5 text-foreground placeholder:text-muted-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring/20"
               />
-              {errors.amount && (
-                <p className="mt-1 text-sm text-destructive">{errors.amount}</p>
-              )}
+              {errors.amount && <p className="mt-1 text-sm text-destructive">{errors.amount}</p>}
             </div>
 
             <div>
-              <span className="block text-sm font-medium text-foreground">
-                Transaction Type
-              </span>
+              <span className="block text-sm font-medium text-foreground">Transaction Type</span>
               <div className="mt-2 grid grid-cols-2 gap-3">
                 <TypeButton
                   label="Income"
@@ -247,6 +339,26 @@ function Index() {
               </div>
             </div>
 
+            {type === "expense" && (
+              <div>
+                <label htmlFor="category" className="block text-sm font-medium text-foreground">
+                  Category
+                </label>
+                <select
+                  id="category"
+                  value={category}
+                  onChange={(e) => setCategory(e.target.value as ExpenseCategory)}
+                  className="mt-1 w-full rounded-xl border border-input bg-background px-4 py-2.5 text-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring/20"
+                >
+                  {EXPENSE_CATEGORIES.map((cat) => (
+                    <option key={cat} value={cat}>
+                      {cat}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
             <button
               type="submit"
               className="w-full rounded-xl bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
@@ -256,15 +368,22 @@ function Index() {
           </form>
         </section>
 
+        <BudgetManager
+          budgets={budgets}
+          onChange={setBudgets}
+          spendingByCategory={spendingByCategory}
+          formatAmount={formatAmount}
+        />
+
+        <ExpenseCharts transactions={transactions} formatAmount={formatAmount} />
+
+        <ForecastSimulator transactions={transactions} formatAmount={formatAmount} />
+
         <section className="rounded-2xl border border-border bg-card p-5 shadow-sm sm:p-6">
-          <h2 className="text-lg font-semibold text-card-foreground">
-            Transaction History
-          </h2>
+          <h2 className="text-lg font-semibold text-card-foreground">Transaction History</h2>
 
           {transactions.length === 0 ? (
-            <p className="mt-4 text-center text-muted-foreground">
-              No transactions yet
-            </p>
+            <p className="mt-4 text-center text-muted-foreground">No transactions yet</p>
           ) : (
             <ul className="mt-4 space-y-3">
               {transactions.map((transaction) => (
@@ -277,19 +396,17 @@ function Index() {
                       {transaction.description}
                     </p>
                     <p className="mt-0.5 text-xs capitalize text-muted-foreground">
-                      {transaction.type}
+                      {transaction.type === "expense" ? transaction.category : transaction.type}
                     </p>
                   </div>
                   <div className="flex items-center gap-3">
                     <span
                       className={`shrink-0 text-sm font-semibold ${
-                        transaction.type === "income"
-                          ? "text-income"
-                          : "text-expense"
+                        transaction.type === "income" ? "text-income" : "text-expense"
                       }`}
                     >
                       {transaction.type === "income" ? "+" : "-"}
-                      {formatCurrency(transaction.amount)}
+                      {formatAmount(transaction.amount)}
                     </span>
                     <button
                       onClick={() => handleDelete(transaction.id)}
@@ -313,10 +430,12 @@ function SummaryCard({
   label,
   amount,
   variant,
+  formatAmount,
 }: {
   label: string;
   amount: number;
   variant: "income" | "expense" | "balance";
+  formatAmount: (n: number) => string;
 }) {
   const variantClasses = {
     income: "border-income/25 bg-income/5",
@@ -331,14 +450,10 @@ function SummaryCard({
   };
 
   return (
-    <div
-      className={`rounded-2xl border p-5 shadow-sm ${variantClasses[variant]}`}
-    >
+    <div className={`rounded-2xl border p-5 shadow-sm ${variantClasses[variant]}`}>
       <p className="text-sm font-medium text-muted-foreground">{label}</p>
-      <p
-        className={`mt-1 text-2xl font-bold tracking-tight sm:text-3xl ${amountClasses[variant]}`}
-      >
-        {formatCurrency(amount)}
+      <p className={`mt-1 text-2xl font-bold tracking-tight sm:text-3xl ${amountClasses[variant]}`}>
+        {formatAmount(amount)}
       </p>
     </div>
   );
@@ -370,9 +485,7 @@ function TypeButton({
     <button
       type="button"
       onClick={onClick}
-      className={`${baseClasses} ${
-        selected ? selectedClasses[variant] : unselectedClasses
-      }`}
+      className={`${baseClasses} ${selected ? selectedClasses[variant] : unselectedClasses}`}
       aria-pressed={selected}
     >
       {label}
