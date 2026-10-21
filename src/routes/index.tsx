@@ -64,6 +64,7 @@ interface StoredTransaction {
   type: TransactionType;
   category?: ExpenseCategory | "Income";
   createdAt: number;
+  transactionDate?: number;
 }
 
 function migrateTransaction(raw: StoredTransaction): Transaction {
@@ -75,6 +76,7 @@ function migrateTransaction(raw: StoredTransaction): Transaction {
     type: raw.type,
     category: raw.category ?? (raw.type === "income" ? "Income" : "Other"),
     createdAt: raw.createdAt,
+    transactionDate: raw.transactionDate ?? raw.createdAt,
   };
 }
 
@@ -91,6 +93,11 @@ function Index() {
   const [category, setCategory] = useState<ExpenseCategory>("Other");
   const [errors, setErrors] = useState<{ description?: string; amount?: string }>({});
   const [isHydrated, setIsHydrated] = useState(false);
+  const [transactionDate, setTransactionDate] = useState(
+  new Date(Date.now() - new Date().getTimezoneOffset() * 60000)
+    .toISOString()
+    .slice(0, 10),
+);
 
  useEffect(() => {
   let cancelled = false;
@@ -132,15 +139,18 @@ function Index() {
       if (cancelled) return;
 
       setTransactions(
-        (transactionsResult.data ?? []).map((row) => ({
-          id: row.id,
-          description: row.description,
-          amount: Number(row.amount),
-          type: row.type as TransactionType,
-          category: row.category as ExpenseCategory | "Income",
-          createdAt: new Date(row.created_at).getTime(),
-        })),
-      );
+          (transactionsResult.data ?? []).map((row) => ({
+            id: row.id,
+            description: row.description,
+            amount: Number(row.amount),
+            type: row.type as TransactionType,
+            category: row.category as ExpenseCategory | "Income",
+            createdAt: new Date(row.created_at).getTime(),
+            transactionDate: new Date(
+              `${row.transaction_date}T00:00:00`,
+            ).getTime(),
+          })),
+        );
 
       if (budgetsResult.data) {
         setBudgets({
@@ -240,7 +250,7 @@ function Index() {
     const now = new Date();
     for (const t of transactions) {
       if (t.type !== "expense") continue;
-      const d = new Date(t.createdAt);
+      const d = new Date(t.transactionDate ?? t.createdAt);
       // Budgets track the current calendar month.
       if (d.getFullYear() !== now.getFullYear() || d.getMonth() !== now.getMonth()) continue;
       totalsByCategory[t.category] = (totalsByCategory[t.category] ?? 0) + t.amount;
@@ -254,6 +264,7 @@ function Index() {
     amount: number;
     type: TransactionType;
     category: ExpenseCategory | "Income";
+     transactionDate: string;
   }) {
     try {
       if (!supabase) {
@@ -276,6 +287,7 @@ function Index() {
           amount: data.amount,
           type: data.type,
           category: data.category,
+          transaction_date: data.transactionDate,
         })
         .select()
         .single();
@@ -289,6 +301,9 @@ function Index() {
         type: row.type as TransactionType,
         category: row.category as ExpenseCategory | "Income",
         createdAt: new Date(row.created_at).getTime(),
+        transactionDate: new Date(
+          `${row.transaction_date}T00:00:00`,
+        ).getTime(),
       };
 
       setTransactions((prev) => [newTransaction, ...prev]);
@@ -333,6 +348,7 @@ function Index() {
       amount: result.data.amount,
       type: result.data.type,
       category: result.data.type === "income" ? "Income" : category,
+      transactionDate,
     });
 
     if (saved) {
@@ -354,6 +370,7 @@ function Index() {
       amount: data.amount,
       type: "expense",
       category: data.category,
+      transactionDate,
     });
   }
 
@@ -490,6 +507,22 @@ function Index() {
               />
               {errors.amount && <p className="mt-1 text-sm text-destructive">{errors.amount}</p>}
             </div>
+            <div>
+              <label
+                htmlFor="transactionDate"
+                className="block text-sm font-medium text-foreground"
+              >
+                Transaction Date
+              </label>
+              <input
+                id="transactionDate"
+                type="date"
+                value={transactionDate}
+                onChange={(e) => setTransactionDate(e.target.value)}
+                required
+                className="mt-1 w-full rounded-xl border border-input bg-background px-4 py-2.5 text-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring/20"
+              />
+            </div>
 
             <div>
               <span className="block text-sm font-medium text-foreground">Transaction Type</span>
@@ -578,6 +611,11 @@ function Index() {
                       {transaction.type === "income" ? "+" : "-"}
                       {formatAmount(transaction.amount)}
                     </span>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {new Date(
+                        transaction.transactionDate ?? transaction.createdAt,
+                      ).toLocaleDateString("en-IN")}
+                    </p>
                     <button
                       onClick={() => handleDelete(transaction.id)}
                       className="shrink-0 rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive hover:text-destructive-foreground focus:outline-none focus:ring-2 focus:ring-ring"

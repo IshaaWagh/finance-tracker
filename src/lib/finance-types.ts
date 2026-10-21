@@ -21,6 +21,7 @@ export interface Transaction {
   type: TransactionType;
   category: ExpenseCategory | "Income";
   createdAt: number; // epoch ms, used as the transaction date
+  transactionDate: number;
 }
 
 export interface BudgetLimits {

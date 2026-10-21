@@ -23,7 +23,7 @@ export function groupByMonth(transactions: Transaction[]): MonthlyPoint[] {
   const buckets = new Map<string, MonthlyPoint>();
 
   for (const t of transactions) {
-    const d = new Date(t.createdAt);
+    const d = new Date(t.transactionDate ?? t.createdAt);
     const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
     const label = d.toLocaleDateString("en-US", { month: "short", year: "numeric" });
 
